@@ -1,0 +1,8 @@
+vendor/*
+*.csv
+*.xls
+composer.phar
+logs/*
+deps/*
+temp_images/*
+uidnamedb.txt
