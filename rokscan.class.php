@@ -10,11 +10,16 @@ class rokscan extends ADB {
 	public $tesseract;
 	public $uidnamedb;
 	public $log;
-	public function __construct($host='127.0.0.1', $port='7555', $bin_path = 'deps/platform-tools/') {
-		parent::__construct($host, $port, $bin_path);
+	public function __construct($skipadb=false, $host='127.0.0.1', $port='7555', $bin_path = 'deps/platform-tools/') {
+		if(!$skipadb) {
+			echo "\n".'Initializing ADB'."\n";
+			parent::__construct($host, $port, $bin_path);
+		}
+		echo "\n".'Initializing Tesseract'."\n";
 		$this->tesseract = new TesseractOCR();
 		$this->tesseract->tessdataDir($GLOBALS['basedir'] . '/deps/tessdata');
 		$this->tesseract->userWords($GLOBALS['basedir'] . '/deps/user-words.txt');
+		echo "\n".'Initializing uidnamedb'."\n";
 		if(!file_exists(dirname(__FILE__) . '/uidnamedb.txt')) {
 			touch(dirname(__FILE__) . '/uidnamedb.txt');
 		}
@@ -41,17 +46,74 @@ class rokscan extends ADB {
 		print_r($cur);
 	}
 
-	public function scan($number=600, $print=false, $onlyid=false) {
+	public function multipassscan($number=600, $print=false, $onlyid=false, $builduidnamedb=true, $target=1, $mod=3) {
+		if($target == 1) {
+			$target = uniqid();
+		}
 		$result = array();
-		$ids = array();
-		$skip = false;
+		$ids = array(); //control variable to disallow the possibility to have multiple time the same id in the results although it will tolerate it if we get id=0
+		$skip = false; //skip will be used incase we have unscannable items, which happens with people disapearing from KD but still listed as active -- only used in pass 1
+		
+		//pass 1 scan the KD and save screenshots to target*
+		if($mod == 1 || $mod == 3) {
+			echo 'Pass 1 scan the KD and save screenshots to target (' . $target . ')'."\n";
+			for($i=0; $i<$number; $i++) {
+				echo 'Progression: ' . (($i * 100) / $number) . '%'."\n";
+				$line = array();
+				sleep(1);
+				$line = $this->openuser($i, $onlyid, $skip, $target);
+				if($skip) {
+					$i--; //do not consume one turn on a skip
+					$skip = false;
+				}
+				if($line !== false) {
+					$this->closeuser();
+					sleep(1);
+				} else {
+					$skip = true;
+				}
+			}
+		}
+		if($mod == 2 || $mod == 3) {
+			//pass2 read screenshots and produce result
+			echo 'Pass 2 read screenshots from target and produce result'."\n";
+			//in pass 2 we override number as we already know how many people we can produce result for
+			$newnumber = count(glob($GLOBALS['basedir'] . '/temp_images/' . $target . '/*'));
+			//but only if newnumber is less than number because we should allow someone to just test the first 10 if he wants
+			if($newnumber <= $number) {
+				$number = $newnumber;
+			}
+			echo 'Pass 2 new number is ' . $number ."\n";
+			for($i=0; $i<$number; $i++) {
+				echo 'Progression: ' . (($i * 100) / $number) . '%'."\n";
+				$line = array();
+				$line = $this->openlocaluser($i, $onlyid, $target);
+				if(isset($line['id']) && (!in_array($line['id'], $ids) || (int)$line['id'] == 0)) {
+					array_push($ids, $line['id']);
+					array_push($result, $line);
+				}
+			}
+			//builduidnamedb as a way to correct id sometimes when we cannot get a good result from tesseract
+			//should only be ran when number is high enough to have data
+			if($builduidnamedb && $number>=300) {
+				$this->builduidnamedb($result);
+			}
+			//produce file
+			$this->producefile($print, $target, $number, $result);
+		}
+	}
+
+	public function scan($number=600, $print=false, $onlyid=false, $builduidnamedb=true) {
+		$result = array();
+		$ids = array(); //control variable to disallow the possibility to have multiple time the same id in the results although it will tolerate it if we get id=0
+		$skip = false; //skip will be used incase we have unscannable items, which happens with people disapearing from KD but still listed as active
 		for($i=0; $i<$number; $i++) {
 			echo 'Progression: ' . (($i * 100) / $number) . '%'."\n";
 			$line = array();
 			sleep(1);
 			$line = $this->openuser($i, $onlyid, $skip);
 			if($skip) {
-				$i--; //do not consume on turn on a skip
+				$i--; //do not consume one turn on a skip
 				$skip = false;
 			}
 			if($line !== false) {
@@ -65,46 +127,68 @@ class rokscan extends ADB {
 				$skip = true;
 			}
 		}
+		//builduidnamedb as a way to correct id sometimes when we cannot get a good result from tesseract
+		//should only be ran when number is high enough to have data
+		if($builduidnamedb && $number>300) {
+			$this->builduidnamedb($result);
+		}
+		//produce file
+		$this->producefile($print, 1, $number, $result);
+	}
+
+	private function builduidnamedb($result) {
+		echo "\n".'Producing uidnamedb'."\n";
 		$tmptxt = '';
 		foreach($result as $r) {
 			$tmptxt .= $r['name'] . '==' . (int)$r['id'] . "\n";
 		}
 		file_put_contents(dirname(__FILE__) . '/uidnamedb.txt', $tmptxt);
-		if($print === FALSE) {
-			echo 'Producing file'."\n";
-			$content = 'ID,Name,Power,Killpoints,Deads,T1 Kills,T2 Kills,T3 Kills,T4 Kills,T5 Kills,Total Kills,T45 Kills,Ranged,Rss Gathered,Rss Assistance,Helps,Alliance'."\n";
-			foreach($result as $r) {
-				$content .= $r['id'] . ',' . $r['name'] . ',' . $r['power'] . ',' . $r['kps'] . ',';
-				$content .= (isset($r['deads']))?$r['deads']:0;
-				$content .= ',';
-				$content .= (isset($r['T1']))?$r['T1']:0;
-				$content .= ',';
-				$content .= (isset($r['T2']))?$r['T2']:0;
-				$content .= ',';
-				$content .= (isset($r['T3']))?$r['T3']:0;
-				$content .= ',';
-				$content .= (isset($r['T4']))?$r['T4']:0;
-				$content .= ',';
-				$content .= (isset($r['T5']))?$r['T5']:0;
-				$content .= ',';
-				$content .= (isset($r['Total']))?$r['Total kills']:0;
-				$content .= ',';
-				$content .= (isset($r['T45']))?$r['T45']:0;
-				$content .= ',';
-				$content .= (isset($r['ranged']))?$r['ranged']:0;
-				$content .= ',';
-				$content .= (isset($r['rssgather']))?$r['rssgather']:0;
-				$content .= ',';
-				$content .= (isset($r['rssassist']))?$r['rssassist']:0;
-				$content .= ',';
-				$content .= (isset($r['helps']))?$r['helps']:0;
-				$content .= ',';
-				$content .= $r['alliance'] . "\n";
-			}
-			file_put_contents($GLOBALS['basedir'] . '/TOP' . $number . '-' . date('Y') . '-' . date('m') . '-' . date('d') . '-1303-[' . uniqid() . '].csv', $content);
-			echo 'Finished'."\n";
+	}
+
+	private function producefile($print=false, $target=1, $number=600, $result=array()) {
+		if($target == 1) {
+			$target = uniqid();
+		}
+		if(count($result) == 0) {
+			echo "\n".'No data to work with'."\n";
 		} else {
-			print_r($result);
+			if($print === FALSE) {
+				echo 'Producing file'."\n";
+				$content = 'ID,Name,Power,Killpoints,Deads,T1 Kills,T2 Kills,T3 Kills,T4 Kills,T5 Kills,Total Kills,T45 Kills,Ranged,Rss Gathered,Rss Assistance,Helps,Alliance'."\n";
+				foreach($result as $r) {
+					$content .= $r['id'] . ',' . $r['name'] . ',' . $r['power'] . ',' . $r['kps'] . ',';
+					$content .= (isset($r['deads']))?$r['deads']:0;
+					$content .= ',';
+					$content .= (isset($r['T1']))?$r['T1']:0;
+					$content .= ',';
+					$content .= (isset($r['T2']))?$r['T2']:0;
+					$content .= ',';
+					$content .= (isset($r['T3']))?$r['T3']:0;
+					$content .= ',';
+					$content .= (isset($r['T4']))?$r['T4']:0;
+					$content .= ',';
+					$content .= (isset($r['T5']))?$r['T5']:0;
+					$content .= ',';
+					$content .= (isset($r['Total']))?$r['Total kills']:0;
+					$content .= ',';
+					$content .= (isset($r['T45']))?$r['T45']:0;
+					$content .= ',';
+					$content .= (isset($r['ranged']))?$r['ranged']:0;
+					$content .= ',';
+					$content .= (isset($r['rssgather']))?$r['rssgather']:0;
+					$content .= ',';
+					$content .= (isset($r['rssassist']))?$r['rssassist']:0;
+					$content .= ',';
+					$content .= (isset($r['helps']))?$r['helps']:0;
+					$content .= ',';
+					$content .= $r['alliance'] . "\n";
+				}
+				file_put_contents($GLOBALS['basedir'] . '/TOP' . $number . '-' . date('Y') . '-' . date('m') . '-' . date('d') . '-1303-[' . $target . '].csv', $content);
+				echo "\n".'Finished'."\n";
+			} else {
+				print_r($result);
+				echo "\n".'Finished'."\n";
+			}
 		}
 	}
 
@@ -204,7 +288,54 @@ class rokscan extends ADB {
 		}
 	}
 
-	public function openuser($i=0, $onlyid=false, $skip=false) {
+	public function openlocaluser($i=0, $onlyid=false, $target=NULL) {
+		//process mainscreen
+		$name = file_get_contents($GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i . '/name.txt');
+		list($id,$power,$kps,$alliance) = $this->processmainscreen($GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i . '/mainscreen.png', $name);
+
+		if($onlyid === FALSE) {
+			//process kp screen
+			list($T1,$T2,$T3,$T4,$T5,$ranged) = $this->processkpscreen($GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i . '/kpscreen.png', $name);
+
+			$calculatedkp = (round($T1 *  0.2) + ($T2 * 2) + ($T3 * 4) + ($T4 * 10) + ($T5 * 20));
+			if($calculatedkp != $kps) {
+				echo "\n" . 'There is a problem with KPs here, main KP screen is ' . $kps . ' but detail and formula give ' . $calculatedkp . "\n";
+			}
+
+			//process more screen
+			list($deads,$rssgather,$rssassist,$helps) = $this->processmorestatsscreen($GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i . '/morestats.png', $name);
+
+			return array(
+				'id' => $id,
+				'name' => $name,
+				'power' => $power,
+				'kps' => $kps, //should be round($T1 *  0.2) + ($T2 * 2) + ($T3 * 4) + ($T4 * 10) + ($T5 * 20)
+				'deads' => $deads,
+				'T1' => $T1,
+				'T2' => $T2,
+				'T3' => $T3,
+				'T4' => $T4,
+				'T5' => $T5,
+				'Total kills' => $kps,
+				'T45' => ($T4 * 10) + ($T5 * 20),
+				'ranged' => $ranged,
+				'rssgather' => $rssgather,
+				'rssassist' => $rssassist,
+				'helps' => $helps,
+				'alliance' => $alliance,
+			);
+		} else {
+			return array(
+				'id' => $id,
+				'name' => $name,
+				'power' => $power,
+				'kps' => $kps,
+				'alliance' => $alliance,
+			);
+		}
+	}
+
+	public function openuser($i=0, $onlyid=false, $skip=false, $target=false) {
 
 		$startX = 401;
 		$startY = 349;
@@ -260,36 +391,19 @@ class rokscan extends ADB {
 			$this->screenshotandretrieve('mainscreen.png');
 			usleep(rand(700000, 900000));
 
-			$im = imagecreatefrompng($GLOBALS['basedir'] . '/temp_images/mainscreen.png');
-			$this->imageSaturation($im, -20); //desaturate colors to make OCR's job easier
-			$idttext = $this->processtesseract($im, ['x'=>705, 'y'=>212, 'width'=>391, 'height'=>42]);
-			$idpreg = preg_replace('`[^\(]+\([^:]+:([^\)]+)\)?`', '$1', $idttext);
-			$id = str_replace(')', '', $this->formatnumber($idpreg));
-			$this->namecopy();
-			$name = exec('powershell Get-Clipboard');
-
-			if((int)$id == 0) {
-				//let's do a fallback and check if we already have an id for that name in the database
-				$this->doLog('[error] name = ' . $name . ', idtext = ' . $idttext . ', idpreg = ' . $idpreg . ', id = ' . $id . "\n");
-				if(isset($this->uidnamedb[$name])) {
-					$id = $this->uidnamedb[$name];
-					$this->doLog('[fallback] name = ' . $name . ', id = ' . $id . "\n");
+			if($target !== false) {
+				if(!file_exists($GLOBALS['basedir'] . '/temp_images/' . $target) || !file_exists($GLOBALS['basedir'] . '/temp_images/' . $target . '/'. $i)) {
+					mkdir($GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i, 0770, true);
 				}
-				$this->doLog('[fallbackerror] name = ' . $name . ', id = 0 ' . "\n");
+				copy($GLOBALS['basedir'] . '/temp_images/mainscreen.png', $GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i . '/mainscreen.png');
+				$this->namecopy();
+				$name = exec('powershell Get-Clipboard');
+				file_put_contents($GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i . '/name.txt', $name);
 			} else {
-				$this->doLog('[good] name = ' . $name . ', idtext = ' . $idttext . ', idpreg = ' . $idpreg . ', id = ' . $id . "\n");
+				$name = file_get_contents($GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i . '/name.txt');
+				list($id,$power,$kps,$alliance) = $this->processmainscreen($GLOBALS['basedir'] . '/temp_images/mainscreen.png', $name);
+				
 			}
-
-			$power = $this->formatnumber($this->processtesseract($im, ['x'=>1053, 'y'=>390, 'width'=>271, 'height'=>35]));
-			if($power == 0) {
-				$this->doLog('[error] Power shouldn\'t be 0 for ' . $name . ' ...' . "\n");
-			}
-			$kps = $this->formatnumber($this->processtesseract($im, ['x'=>1434, 'y'=>390, 'width'=>230, 'height'=>36]));
-			if($kps == 0) {
-				$this->doLog('[error] Kps shouldn\'t be 0 for ' . $name . ' ...' . "\n");
-			}
-			$alliance = mb_ereg_replace('Phoenix', 'Phœnix', $this->processtesseract($im, ['x'=>707, 'y'=>390, 'width'=>330, 'height'=>38]));
-
 			if($onlyid === FALSE) {
 				//process kp screen
 				$this->openkpstats();
@@ -298,32 +412,18 @@ class rokscan extends ADB {
 				$this->screenshotandretrieve('kpscreen.png');
 				usleep(rand(700000, 900000));
 
-				$im     = imagecreatefrompng($GLOBALS['basedir'] . '/temp_images/kpscreen.png');
-				//$this->imageSaturation($im, -80); //saturate colors to make OCR's job easier
+				if($target !== false) {
+					if(!file_exists($GLOBALS['basedir'] . '/temp_images/' . $target) || !file_exists($GLOBALS['basedir'] . '/temp_images/' . $target . '/'. $i)) {
+						mkdir($GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i, 0770, true);
+					}
+					copy($GLOBALS['basedir'] . '/temp_images/kpscreen.png', $GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i . '/kpscreen.png');
+				} else {
+					list($T1,$T2,$T3,$T4,$T5,$ranged) = $this->processkpscreen($GLOBALS['basedir'] . '/temp_images/kpscreen.png', $name);
 
-				$T1 = $this->formatnumber($this->processtesseract($im, ['x'=>1101, 'y'=>506, 'width'=>275, 'height'=>32]));
-				if($T1 == 0) {
-					$this->doLog('[error] T1 shouldn\'t be 0 for ' . $name . ' ...' . "\n");
-				}
-				$T2 = $this->formatnumber($this->processtesseract($im, ['x'=>1101, 'y'=>559, 'width'=>275, 'height'=>32]));
-				if($T2 == 0) {
-					$this->doLog('[error] T2 shouldn\'t be 0 for ' . $name . ' ...' . "\n");
-				}
-				$T3 = $this->formatnumber($this->processtesseract($im, ['x'=>1101, 'y'=>612, 'width'=>275, 'height'=>32]));
-				if($T3 == 0) {
-					$this->doLog('[error] T3 shouldn\'t be 0 for ' . $name . ' ...' . "\n");
-				}
-				$T4 = $this->formatnumber($this->processtesseract($im, ['x'=>1101, 'y'=>666, 'width'=>275, 'height'=>32]));
-				if($T4 == 0) {
-					$this->doLog('[error] T4 shouldn\'t be 0 for ' . $name . ' ...' . "\n");
-				}
-				$T5 = $this->formatnumber($this->processtesseract($im, ['x'=>1101, 'y'=>720, 'width'=>275, 'height'=>32]));
-				if($T5 == 0) {
-					$this->doLog('[error] T5 shouldn\'t be 0 for ' . $name . ' ...' . "\n");
-				}
-				$ranged = $this->processtesseract($im, ['x'=>1613, 'y'=>840, 'width'=>160, 'height'=>35]);
-				if($ranged == 0) {
-					$this->doLog('[error] Ranged shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+					$calculatedkp = (round($T1 *  0.2) + ($T2 * 2) + ($T3 * 4) + ($T4 * 10) + ($T5 * 20));
+					if($calculatedkp != $kps) {
+						echo "\n" . 'There is a problem with KPs here, main KP screen is ' . $kps . ' but detail and formula give ' . $calculatedkp . "\n";
+					}
 				}
 
 				//process more screen
@@ -335,61 +435,174 @@ class rokscan extends ADB {
 
 				$this->closemorestats();
 
-				$im     = imagecreatefrompng($GLOBALS['basedir'] . '/temp_images/morestats.png');
-				//$this->imageSaturation($im, -80); //saturate colors to make OCR's job easier
-
-				$deads = $this->formatnumber($this->processtesseract($im, ['x'=>1339, 'y'=>550, 'width'=>245, 'height'=>42]));
-				if($deads == 0) {
-					$this->doLog('[error] Deads shouldn\'t be 0 for ' . $name . ' ...' . "\n");
-				}
-				$rssgather = $this->formatnumber($this->processtesseract($im, ['x'=>1339, 'y'=>764, 'width'=>245, 'height'=>42]));
-				if($rssgather == 0) {
-					$this->doLog('[error] rssgather shouldn\'t be 0 for ' . $name . ' ...' . "\n");
-				}
-				$rssassist = $this->formatnumber($this->processtesseract($im, ['x'=>1339, 'y'=>834, 'width'=>245, 'height'=>42]));
-				if($rssassist == 0) {
-					$this->doLog('[error] rssassist shouldn\'t be 0 for ' . $name . ' ...' . "\n");
-				}
-				$helps = $this->formatnumber($this->processtesseract($im, ['x'=>1339, 'y'=>906, 'width'=>245, 'height'=>42]));
-				if($helps == 0) {
-					$this->doLog('[error] helps shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+				if($target !== false) {
+					if(!file_exists($GLOBALS['basedir'] . '/temp_images/' . $target) || !file_exists($GLOBALS['basedir'] . '/temp_images/' . $target . '/'. $i)) {
+						mkdir($GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i, 0770, true);
+					}
+					copy($GLOBALS['basedir'] . '/temp_images/morestats.png', $GLOBALS['basedir'] . '/temp_images/' . $target . '/' . $i . '/morestats.png');
+				} else {
+					list($deads,$rssgather,$rssassist,$helps) = $this->processmorestatsscreen($GLOBALS['basedir'] . '/temp_images/morestats.png', $name);
 				}
 
-				return array(
-					'id' => $id,
-					'name' => $name,
-					'power' => $power,
-					'kps' => $kps,
-					'deads' => $deads,
-					'T1' => $T1,
-					'T2' => $T2,
-					'T3' => $T3,
-					'T4' => $T4,
-					'T5' => $T5,
-					'Total kills' => $kps,
-					'T45' => ($T4 * 10) + ($T5 * 20),
-					'ranged' => $ranged,
-					'rssgather' => $rssgather,
-					'rssassist' => $rssassist,
-					'helps' => $helps,
-					'alliance' => $alliance,
-				);
+				if($target !== false) {
+					return true;
+				} else {
+					return array(
+						'id' => $id,
+						'name' => $name,
+						'power' => $power,
+						'kps' => $kps, //should be round($T1 *  0.2) + ($T2 * 2) + ($T3 * 4) + ($T4 * 10) + ($T5 * 20)
+						'deads' => $deads,
+						'T1' => $T1,
+						'T2' => $T2,
+						'T3' => $T3,
+						'T4' => $T4,
+						'T5' => $T5,
+						'Total kills' => $kps,
+						'T45' => ($T4 * 10) + ($T5 * 20),
+						'ranged' => $ranged,
+						'rssgather' => $rssgather,
+						'rssassist' => $rssassist,
+						'helps' => $helps,
+						'alliance' => $alliance,
+					);
+				}
 			} else {
-				return array(
-					'id' => str_replace(')', '', $id),
-					'name' => $name,
-					'power' => $power,
-					'kps' => $kps,
-					'alliance' => $alliance,
-				);
+				if($target !== false) {
+					return true;
+				} else {
+					return array(
+						'id' => $id,
+						'name' => $name,
+						'power' => $power,
+						'kps' => $kps,
+						'alliance' => $alliance,
+					);
+				}
 			}
 		} else {
 			return false;
 		}
 	}
 
+	private function processmainscreen($image, $name) {
+		$im = imagecreatefrompng($image);
+		$this->imageSaturation($im, -20); //desaturate colors to make OCR's job easier
+//~ echo 'idttext' . "\n";
+		$idttext = $this->processtesseract($im, ['x'=>705, 'y'=>212, 'width'=>391, 'height'=>42]);
+		$idpreg = preg_replace('`[^\(]+\([^:]+:([^\)]+)\)?`', '$1', $idttext);
+		$id = str_replace(')', '', $this->formatnumber($idpreg));
+
+		if((int)$id == 0) {
+			//let's do a fallback and check if we already have an id for that name in the database
+			$this->doLog('[error] name = ' . $name . ', idtext = ' . $idttext . ', idpreg = ' . $idpreg . ', id = ' . $id . "\n");
+			if(isset($this->uidnamedb[$name])) {
+				$id = $this->uidnamedb[$name];
+				$this->doLog('[fallback] name = ' . $name . ', id = ' . $id . "\n");
+			}
+			$this->doLog('[fallbackerror] name = ' . $name . ', id = 0 ' . "\n");
+		} else {
+			$this->doLog('[good] name = ' . $name . ', idtext = ' . $idttext . ', idpreg = ' . $idpreg . ', id = ' . $id . "\n");
+		}
+//~ echo 'power' . "\n";
+		$power = $this->formatnumber($this->processtesseract($im, ['x'=>1053, 'y'=>390, 'width'=>271, 'height'=>35]));
+		if($power == 0) {
+			$this->doLog('[error] Power shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+//~ echo 'kps' . "\n";
+		$kps = $this->formatnumber($this->processtesseract($im, ['x'=>1434, 'y'=>390, 'width'=>230, 'height'=>36]));
+		if($kps == 0) {
+			$this->doLog('[error] Kps shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+//~ echo 'alliance' . "\n";
+		//something tesseract never get right
+		$alliance = mb_ereg_replace('oe', 'œ', $this->processtesseract($im, ['x'=>707, 'y'=>390, 'width'=>330, 'height'=>38]));
+		
+		return array(
+			$id,
+			$power,
+			$kps,
+			$alliance
+		);
+	}
+
+	private function processkpscreen($image, $name) {
+		$im     = imagecreatefrompng($image);
+		
+		//$this->imageSaturation($im, -80); //saturate colors to make OCR's job easier
+echo 'T1' . "\n";
+		$T1 = $this->formatnumber($this->processtesseract($im, ['x'=>1101, 'y'=>506, 'width'=>275, 'height'=>32]));
+		if($T1 == 0) {
+			$this->doLog('[error] T1 shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+echo 'T2' . "\n";
+		$T2 = $this->formatnumber($this->processtesseract($im, ['x'=>1101, 'y'=>559, 'width'=>275, 'height'=>32]));
+		if($T2 == 0) {
+			$this->doLog('[error] T2 shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+echo 'T3' . "\n";
+		$T3 = $this->formatnumber($this->processtesseract($im, ['x'=>1101, 'y'=>612, 'width'=>275, 'height'=>32]));
+		if($T3 == 0) {
+			$this->doLog('[error] T3 shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+echo 'T4' . "\n";
+		$T4 = $this->formatnumber($this->processtesseract($im, ['x'=>1101, 'y'=>666, 'width'=>275, 'height'=>32]));
+		if($T4 == 0) {
+			$this->doLog('[error] T4 shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+echo 'T5' . "\n";
+		$T5 = $this->formatnumber($this->processtesseract($im, ['x'=>1101, 'y'=>720, 'width'=>275, 'height'=>32]));
+		if($T5 == 0) {
+			$this->doLog('[error] T5 shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+echo 'ranged' . "\n";
+		$ranged = $this->processtesseract($im, ['x'=>1613, 'y'=>840, 'width'=>160, 'height'=>35]);
+		if($ranged == 0) {
+			$this->doLog('[error] Ranged shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+		
+		return array(
+			$T1,
+			$T2,
+			$T3,
+			$T4,
+			$T5,
+			$ranged
+		);
+	}
+
+	private function processmorestatsscreen($image, $name) {
+		$im     = imagecreatefrompng($image);
+		//$this->imageSaturation($im, -80); //saturate colors to make OCR's job easier
+echo 'deads' . "\n";
+		$deads = $this->formatnumber($this->processtesseract($im, ['x'=>1339, 'y'=>550, 'width'=>245, 'height'=>42]));
+		if($deads == 0) {
+			$this->doLog('[error] Deads shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+echo 'rssgather' . "\n";
+		$rssgather = $this->formatnumber($this->processtesseract($im, ['x'=>1339, 'y'=>764, 'width'=>245, 'height'=>42]));
+		if($rssgather == 0) {
+			$this->doLog('[error] rssgather shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+echo 'rssassist' . "\n";
+		$rssassist = $this->formatnumber($this->processtesseract($im, ['x'=>1339, 'y'=>834, 'width'=>245, 'height'=>42]));
+		if($rssassist == 0) {
+			$this->doLog('[error] rssassist shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+echo 'helps' . "\n";
+		$helps = $this->formatnumber($this->processtesseract($im, ['x'=>1339, 'y'=>906, 'width'=>245, 'height'=>42]));
+		if($helps == 0) {
+			$this->doLog('[error] helps shouldn\'t be 0 for ' . $name . ' ...' . "\n");
+		}
+		return array(
+			$deads,
+			$rssgather,
+			$rssassist,
+			$helps
+		);
+	}
+
 	public function doLog($txt) {
-		echo $txt;
 		$this->log .= $txt;
 	}
 
